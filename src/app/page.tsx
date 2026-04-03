@@ -21,6 +21,7 @@ type ChatMessage = {
 
 type StreamChunk = {
   messageId: string;
+  sessionId: string;
   seq: number;
   type: "token" | "done";
   token?: string;
@@ -32,15 +33,23 @@ const RETRY_DELAYS = [600, 1200];
 export default function Home() {
   const [messages, setMessages] = useState<ChatMessage[]>([]);
   const [input, setInput] = useState("");
-  const [connectionStatus, setConnectionStatus] = useState<ConnectionStatus>("idle");
+  const [connectionStatus, setConnectionStatus] =
+    useState<ConnectionStatus>("idle");
   const [isStreaming, setIsStreaming] = useState(false);
+  const [sessionId, setSessionId] = useState<string | null>(null);
 
+  // EventSource 与重连控制参数都用 ref，避免渲染周期内状态丢失。
   const eventSourceRef = useRef<EventSource | null>(null);
   const retryTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
   const retryCountRef = useRef(0);
   const seenSeqRef = useRef<Set<number>>(new Set());
   const lastSeqRef = useRef(0);
-  const activeRequestRef = useRef<{ question: string; requestId: string; assistantId: string } | null>(null);
+  const activeRequestRef = useRef<{
+    question: string;
+    requestId: string;
+    assistantId: string;
+    sessionId: string | null;
+  } | null>(null);
 
   useEffect(() => {
     return () => {
@@ -53,8 +62,13 @@ export default function Home() {
     };
   }, []);
 
-  const updateAssistantMessage = (assistantId: string, updater: (msg: ChatMessage) => ChatMessage) => {
-    setMessages((prev) => prev.map((msg) => (msg.id === assistantId ? updater(msg) : msg)));
+  const updateAssistantMessage = (
+    assistantId: string,
+    updater: (msg: ChatMessage) => ChatMessage,
+  ) => {
+    setMessages((prev) =>
+      prev.map((msg) => (msg.id === assistantId ? updater(msg) : msg)),
+    );
   };
 
   const closeStream = () => {
@@ -87,6 +101,7 @@ export default function Home() {
     closeStream();
   };
 
+  // 断流后按退避时间重连，并复用同一请求参数（含 sessionId/cursor）。
   const scheduleReconnect = () => {
     const active = activeRequestRef.current;
     if (!active) return;
@@ -105,11 +120,21 @@ export default function Home() {
     }
 
     retryTimerRef.current = setTimeout(() => {
-      connectStream(active.question, active.requestId, active.assistantId);
+      connectStream(
+        active.question,
+        active.requestId,
+        active.assistantId,
+        active.sessionId,
+      );
     }, delay);
   };
 
   const handleChunk = (data: StreamChunk, assistantId: string) => {
+    if (!sessionId && data.sessionId) {
+      setSessionId(data.sessionId);
+    }
+
+    // 以 seq 做幂等去重，避免重连后重复渲染 token。
     if (data.seq <= 0) return;
     if (seenSeqRef.current.has(data.seq)) return;
 
@@ -130,18 +155,33 @@ export default function Home() {
     }
   };
 
-  const connectStream = (question: string, requestId: string, assistantId: string) => {
+  const connectStream = (
+    question: string,
+    requestId: string,
+    assistantId: string,
+    sessionIdValue: string | null,
+  ) => {
     closeStream();
 
-    const es = new EventSource(
-      `/api/chat/stream?q=${encodeURIComponent(question)}&requestId=${encodeURIComponent(requestId)}&cursor=${lastSeqRef.current}`,
-    );
+    const url = new URL("/api/chat/stream", window.location.origin);
+    url.searchParams.set("q", question);
+    url.searchParams.set("requestId", requestId);
+    url.searchParams.set("cursor", String(lastSeqRef.current));
+
+    if (sessionIdValue) {
+      url.searchParams.set("sessionId", sessionIdValue);
+    }
+
+    const es = new EventSource(url.toString());
 
     eventSourceRef.current = es;
 
     es.onopen = () => {
       setConnectionStatus("streaming");
-      updateAssistantMessage(assistantId, (msg) => ({ ...msg, status: "streaming" }));
+      updateAssistantMessage(assistantId, (msg) => ({
+        ...msg,
+        status: "streaming",
+      }));
     };
 
     es.onmessage = (event) => {
@@ -161,6 +201,7 @@ export default function Home() {
 
   const sendMessage = () => {
     const question = input.trim();
+    // 流式进行中禁止并发发送，避免请求与状态机互相覆盖。
     if (!question || isStreaming) return;
 
     const now = Date.now();
@@ -181,9 +222,9 @@ export default function Home() {
     retryCountRef.current = 0;
     seenSeqRef.current = new Set();
     lastSeqRef.current = 0;
-    activeRequestRef.current = { question, requestId, assistantId };
+    activeRequestRef.current = { question, requestId, assistantId, sessionId };
 
-    connectStream(question, requestId, assistantId);
+    connectStream(question, requestId, assistantId, sessionId);
   };
 
   const connectionText: Record<ConnectionStatus, string> = {
@@ -210,9 +251,15 @@ export default function Home() {
         <aside className="hidden w-72 rounded-xl border border-zinc-200 bg-white p-4 lg:block">
           <h2 className="mb-3 text-sm font-semibold text-zinc-700">会话列表</h2>
           <div className="space-y-2 text-sm">
-            <div className="rounded-lg bg-zinc-100 px-3 py-2">广告投放优化（当前）</div>
-            <div className="rounded-lg px-3 py-2 text-zinc-500">素材审核自动化</div>
-            <div className="rounded-lg px-3 py-2 text-zinc-500">归因链路分析</div>
+            <div className="rounded-lg bg-zinc-100 px-3 py-2">
+              广告投放优化（当前）
+            </div>
+            <div className="rounded-lg px-3 py-2 text-zinc-500">
+              素材审核自动化
+            </div>
+            <div className="rounded-lg px-3 py-2 text-zinc-500">
+              归因链路分析
+            </div>
           </div>
         </aside>
 
@@ -220,9 +267,13 @@ export default function Home() {
           <header className="flex items-center justify-between border-b border-zinc-200 px-4 py-3">
             <div>
               <h1 className="text-base font-semibold">Agent 对话工作台</h1>
-              <p className="text-xs text-zinc-500">W1：流式渲染 + 重连 + 去重</p>
+              <p className="text-xs text-zinc-500">
+                W1：流式渲染 + 重连 + 去重
+              </p>
             </div>
-            <div className={`rounded-full px-3 py-1 text-xs font-medium ${connectionClass[connectionStatus]}`}>
+            <div
+              className={`rounded-full px-3 py-1 text-xs font-medium ${connectionClass[connectionStatus]}`}
+            >
               {connectionText[connectionStatus]}
             </div>
           </header>
@@ -237,7 +288,10 @@ export default function Home() {
             {messages.map((msg) => {
               const isUser = msg.role === "user";
               return (
-                <div key={msg.id} className={`flex ${isUser ? "justify-end" : "justify-start"}`}>
+                <div
+                  key={msg.id}
+                  className={`flex ${isUser ? "justify-end" : "justify-start"}`}
+                >
                   <div
                     className={`max-w-[80%] rounded-2xl px-4 py-3 text-sm ${
                       isUser
@@ -246,7 +300,9 @@ export default function Home() {
                     }`}
                   >
                     <p>{msg.content || "..."}</p>
-                    <p className="mt-2 text-[11px] opacity-70">状态：{msg.status}</p>
+                    <p className="mt-2 text-[11px] opacity-70">
+                      状态：{msg.status}
+                    </p>
                   </div>
                 </div>
               );
