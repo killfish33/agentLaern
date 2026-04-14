@@ -27,8 +27,23 @@ type StreamChunk = {
   token?: string;
 };
 
+type SessionSummary = {
+  id: string;
+  title: string | null;
+  createdAt: string;
+  lastMessage: {
+    id: string;
+    role: "user" | "assistant" | "system";
+    content: string;
+    status: MessageStatus;
+    createdAt: string;
+  } | null;
+};
+
 const MAX_RETRIES = 2;
 const RETRY_DELAYS = [600, 1200];
+// 会话切换时保留最短 loading 时间，避免内容瞬切导致视觉生硬。
+const MIN_SESSION_SWITCH_LOADING_MS = 260;
 
 export default function Home() {
   const [messages, setMessages] = useState<ChatMessage[]>([]);
@@ -37,8 +52,12 @@ export default function Home() {
     useState<ConnectionStatus>("idle");
   const [isStreaming, setIsStreaming] = useState(false);
   const [sessionId, setSessionId] = useState<string | null>(null);
+  const [sessions, setSessions] = useState<SessionSummary[]>([]);
+  const [sessionsLoading, setSessionsLoading] = useState(false);
+  const [sessionMessagesLoading, setSessionMessagesLoading] = useState(false);
 
   // EventSource 与重连控制参数都用 ref，避免渲染周期内状态丢失。
+  // 这些值会在 onmessage/onerror 回调中被频繁读写，不适合放在 state。
   const eventSourceRef = useRef<EventSource | null>(null);
   const retryTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
   const retryCountRef = useRef(0);
@@ -52,6 +71,9 @@ export default function Home() {
   } | null>(null);
 
   useEffect(() => {
+    // 首屏拉取历史会话列表，供左侧会话导航使用。
+    void loadSessions();
+
     return () => {
       if (eventSourceRef.current) {
         eventSourceRef.current.close();
@@ -78,6 +100,133 @@ export default function Home() {
     }
   };
 
+  const getSessionDisplayTitle = (session: SessionSummary) => {
+    // 标题优先级：显式标题 > 最近一条消息摘要 > 会话 ID 尾号。
+    const safeTitle = session.title?.trim();
+    if (safeTitle) return safeTitle;
+    const lastContent = session.lastMessage?.content?.trim();
+    if (lastContent) return lastContent.slice(0, 20);
+    return `会话 ${session.id.slice(-6)}`;
+  };
+
+  const loadSessions = async () => {
+    // 仅负责左侧会话摘要，不加载具体消息内容。
+    setSessionsLoading(true);
+    try {
+      const response = await fetch("/api/sessions?limit=30", {
+        method: "GET",
+        cache: "no-store",
+      });
+      if (!response.ok) {
+        setSessions([]);
+        return;
+      }
+      const payload = (await response.json()) as {
+        ok: boolean;
+        data?: SessionSummary[];
+      };
+      setSessions(Array.isArray(payload.data) ? payload.data : []);
+    } catch {
+      setSessions([]);
+    } finally {
+      setSessionsLoading(false);
+    }
+  };
+
+  const mapHistoryMessages = (rawList: unknown): ChatMessage[] => {
+    // 对历史消息做一次“窄化 + 容错”，确保 UI 层拿到稳定结构。
+    if (!Array.isArray(rawList)) {
+      return [];
+    }
+
+    return rawList
+      .map((item) => {
+        if (!item || typeof item !== "object") {
+          return null;
+        }
+        const rawItem = item as Record<string, unknown>;
+        const role = rawItem.role;
+        if (role !== "user" && role !== "assistant") {
+          return null;
+        }
+        const status = rawItem.status;
+        return {
+          id:
+            typeof rawItem.id === "string"
+              ? rawItem.id
+              : `msg_${Math.random().toString(36).slice(2, 8)}`,
+          role,
+          content: typeof rawItem.content === "string" ? rawItem.content : "",
+          status:
+            status === "pending" ||
+            status === "streaming" ||
+            status === "done" ||
+            status === "error"
+              ? status
+              : "done",
+        } satisfies ChatMessage;
+      })
+      .filter((item): item is ChatMessage => Boolean(item));
+  };
+
+  const loadSessionMessages = async (targetSessionId: string) => {
+    // 记录切换起点，用于计算最短过渡时长。
+    const switchStartAt = Date.now();
+
+    // 切换会话前先把流式链路清空，避免旧会话 token 串到新会话。
+    closeStream();
+    setIsStreaming(false);
+    setConnectionStatus("idle");
+    retryCountRef.current = 0;
+    seenSeqRef.current = new Set();
+    lastSeqRef.current = 0;
+    activeRequestRef.current = null;
+    setSessionId(targetSessionId);
+    setSessionMessagesLoading(true);
+
+    try {
+      const response = await fetch(
+        `/api/sessions/${encodeURIComponent(targetSessionId)}/messages`,
+        {
+          method: "GET",
+          cache: "no-store",
+        },
+      );
+
+      if (!response.ok) {
+        setMessages([]);
+        return;
+      }
+
+      const payload = (await response.json()) as {
+        ok: boolean;
+        data?: unknown;
+      };
+      const nextMessages = mapHistoryMessages(payload.data);
+      // 即使接口很快，也至少等待 MIN_SESSION_SWITCH_LOADING_MS，避免闪烁。
+      const elapsed = Date.now() - switchStartAt;
+      const waitTime = Math.max(0, MIN_SESSION_SWITCH_LOADING_MS - elapsed);
+      if (waitTime > 0) {
+        await new Promise((resolve) => {
+          setTimeout(resolve, waitTime);
+        });
+      }
+      setMessages(nextMessages);
+    } catch {
+      // 错误场景保持同样的最短过渡时间，保证切换体验一致。
+      const elapsed = Date.now() - switchStartAt;
+      const waitTime = Math.max(0, MIN_SESSION_SWITCH_LOADING_MS - elapsed);
+      if (waitTime > 0) {
+        await new Promise((resolve) => {
+          setTimeout(resolve, waitTime);
+        });
+      }
+      setMessages([]);
+    } finally {
+      setSessionMessagesLoading(false);
+    }
+  };
+
   const finalizeAsError = (assistantId: string) => {
     updateAssistantMessage(assistantId, (msg) => ({
       ...msg,
@@ -99,6 +248,8 @@ export default function Home() {
     setIsStreaming(false);
     retryCountRef.current = 0;
     closeStream();
+    // 流式结束后刷新左侧会话列表，让最新消息摘要及时可见。
+    void loadSessions();
   };
 
   // 断流后按退避时间重连，并复用同一请求参数（含 sessionId/cursor）。
@@ -130,8 +281,16 @@ export default function Home() {
   };
 
   const handleChunk = (data: StreamChunk, assistantId: string) => {
+    // 首个 chunk 可能返回新建 sessionId，需要同步到当前请求上下文，
+    // 确保后续断线重连仍然绑定同一会话。
     if (!sessionId && data.sessionId) {
       setSessionId(data.sessionId);
+      if (activeRequestRef.current) {
+        activeRequestRef.current = {
+          ...activeRequestRef.current,
+          sessionId: data.sessionId,
+        };
+      }
     }
 
     // 以 seq 做幂等去重，避免重连后重复渲染 token。
@@ -163,6 +322,7 @@ export default function Home() {
   ) => {
     closeStream();
 
+    // cursor 用于断线重连续传；服务端应返回 seq > cursor 的增量数据。
     const url = new URL("/api/chat/stream", window.location.origin);
     url.searchParams.set("q", question);
     url.searchParams.set("requestId", requestId);
@@ -227,6 +387,13 @@ export default function Home() {
     connectStream(question, requestId, assistantId, sessionId);
   };
 
+  const selectSession = (targetSessionId: string) => {
+    // 切换保护：流式中或正在切换时不接受新切换，避免状态竞争。
+    if (!targetSessionId || isStreaming || sessionMessagesLoading) return;
+    if (targetSessionId === sessionId) return;
+    void loadSessionMessages(targetSessionId);
+  };
+
   const connectionText: Record<ConnectionStatus, string> = {
     idle: "未连接",
     connecting: "连接中",
@@ -251,15 +418,37 @@ export default function Home() {
         <aside className="hidden w-72 rounded-xl border border-zinc-200 bg-white p-4 lg:block">
           <h2 className="mb-3 text-sm font-semibold text-zinc-700">会话列表</h2>
           <div className="space-y-2 text-sm">
-            <div className="rounded-lg bg-zinc-100 px-3 py-2">
-              广告投放优化（当前）
-            </div>
-            <div className="rounded-lg px-3 py-2 text-zinc-500">
-              素材审核自动化
-            </div>
-            <div className="rounded-lg px-3 py-2 text-zinc-500">
-              归因链路分析
-            </div>
+            {sessionsLoading && (
+              <div className="rounded-lg border border-dashed border-zinc-300 px-3 py-2 text-zinc-500">
+                会话加载中...
+              </div>
+            )}
+
+            {!sessionsLoading && sessions.length === 0 && (
+              <div className="rounded-lg border border-dashed border-zinc-300 px-3 py-2 text-zinc-500">
+                暂无历史会话
+              </div>
+            )}
+
+            {sessions.map((item) => {
+              const isActive = sessionId === item.id;
+              return (
+                <button
+                  type="button"
+                  key={item.id}
+                  onClick={() => {
+                    selectSession(item.id);
+                  }}
+                  className={`w-full rounded-lg px-3 py-2 text-left ${
+                    isActive
+                      ? "bg-zinc-100 text-zinc-900"
+                      : "text-zinc-500 hover:bg-zinc-50"
+                  }`}
+                >
+                  <p className="truncate">{getSessionDisplayTitle(item)}</p>
+                </button>
+              );
+            })}
           </div>
         </aside>
 
@@ -279,6 +468,12 @@ export default function Home() {
           </header>
 
           <div className="flex-1 space-y-3 overflow-y-auto p-4">
+            {sessionMessagesLoading && (
+              <div className="rounded-lg border border-dashed border-zinc-300 p-4 text-sm text-zinc-500">
+                正在加载历史消息...
+              </div>
+            )}
+
             {messages.length === 0 && (
               <div className="rounded-lg border border-dashed border-zinc-300 p-4 text-sm text-zinc-500">
                 还没有消息，输入问题后点击发送。

@@ -66,9 +66,23 @@ export const chatRepository = {
     });
   },
 
-  async listSessions() {
+  async listSessions(limit = 30) {
     return prisma.session.findMany({
+      take: limit,
       orderBy: { createdAt: "desc" },
+      include: {
+        messages: {
+          take: 1,
+          orderBy: { createdAt: "desc" },
+          select: {
+            id: true,
+            role: true,
+            content: true,
+            status: true,
+            createdAt: true,
+          },
+        },
+      },
     });
   },
 
